@@ -1,0 +1,252 @@
+<?php
+
+/**
+ * Implements hook_admin_paths().
+ */
+function node_export_paragraphs_admin_paths() {
+  if (variable_get('node_admin_theme')) {
+    $paths = array('node/*/node_export' => TRUE,);
+    return $paths;
+  }
+}
+
+function node_export_paragraphs_node_export_alter(&$nodes, $format) {
+
+  $fields = field_info_fields();
+
+  foreach ($nodes as $node) {
+    foreach ($fields as $field_name => $field) {
+      if ($field['type'] == 'paragraphs' && isset($node->$field_name)) {
+        $language = $node->language;
+        foreach ($node->$field_name as $key => $values) {
+          $node->field_paragraph_deploy = node_export_paragraphs_deploy_entity($node, (array ) $field_name);
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Get the field collection entities of a node.
+ */
+function node_export_paragraphs_deploy_entity(&$node, $field_collections) {
+  $export = array();
+
+  foreach ($field_collections as $key => $field_collection) {
+    $entity_ids = array();
+    $field_collection_values = field_view_field('node', $node, $field_collection);
+
+    // Get entity IDs
+    foreach ($field_collection_values['#items'] as $delta => $entity_id) {
+      $entity_ids[] = $entity_id['value'];
+    }
+
+    if (!empty($entity_ids)) {
+
+      $items = entity_load("paragraphs_item", $entity_ids);
+
+      foreach ($items as $item) {
+        $item_export = $item->export();
+        // At some point field collection stopped returning valid JSON here.
+        $prefix = "entity_import('" . $item->entityType() . "', '";
+        if (substr($item_export, 0, strlen($prefix)) === $prefix) {
+          // Re-construct it back into valid JSON.
+          $item_export = substr($item_export, strlen($prefix));
+          $item_export = substr($item_export, 0, -1 * strlen("')"));
+          // This almost certainly doesn't work in the general case
+          // because field_collection passed a 2nd param to addcslashes().
+          $item_export = stripcslashes($item_export);
+        }
+        $item_export = drupal_json_decode($item_export);
+        $export[$field_collection][] = $item_export;
+      }
+    }
+  }
+
+  return $export;
+}
+
+/**
+ *  Get list of bundles that have a Field Collection field.
+ *
+ *  Return array [bundle][field collection][fields in field collection].
+ */
+function node_export_paragraphs_deploy_bundle_fields() {
+  $field_collections = field_info_instances('paragraphs_item');
+  //$field_collections = field_info_instances('field_collection_item');
+  //dprint_R($field_collections);die();
+  foreach ($field_collections as $field_name => $info) {
+    //$field_info = field_info_field($field_name);
+    $field_info = field_info_instances('paragraphs_item', $field_name);
+
+    //dprint_R($field_info);
+    foreach ($field_info['bundles']['node'] as $bundle) {
+      $bundles[$bundle][$field_name] = $info;
+    }
+  }
+  //dprint_R($bundles);die();
+  return $bundles;
+}
+
+/**
+ * Implements hook_node_export_dependency_field().
+ */
+function paragraphs_node_export_dependency_field($entity_type, $entity, $field, $instance, $langcode, $items) {
+  $dependencies = array();
+  node_export_dependency_add($dependencies, $items, 'paragraphs_item', 'value');
+
+  // Loop all items to add their data for export.
+  foreach ($items as $index => $item) {
+    if ($field_collection_item = paragraphs_item_load($item['value'])) {
+      // Add file field data for export.
+      node_export_file_field_export($field_collection_item, $field_collection_item);
+
+      // Add the field collection item data to the exported data. Mimics
+      // EntityAPIController::export() without the JSON conversion.
+      $dependencies[$index]['node_export_paragraph_data'] = get_object_vars($field_collection_item);
+
+      // Support nested fields and field collections too.
+      $dependencies = array_merge($dependencies, field_node_export_dependency($field_collection_item, 'paragraphs_item'));
+    }
+  }
+
+  return $dependencies;
+}
+
+
+function node_export_paragraphs_node_export_after_import_alter(&$nodes, $format, $save) {
+
+  foreach ($nodes as $key => $node) {
+    if (isset($node->field_paragraph_deploy)) {
+      node_export_paragraphs_import_field_collection($node, $node->field_paragraph_deploy);
+    }
+  }
+}
+
+function node_export_paragraphs_import_field_collection($node, $field_collection_deploy) {
+
+  foreach ($field_collection_deploy as $bundle => $field_collection) {
+    $language = ($node->language == '') ? LANGUAGE_NONE : $node->language;
+    $language = LANGUAGE_NONE;
+    $node->$bundle = node_export_paragraphs_import_one_bundle($bundle, $language, $field_collection, $node);
+  }
+  node_save($node);
+}
+
+
+function node_export_paragraphs_import_one_bundle($bundle, $language, $field_collection, $node) {
+
+  $field_values = array();
+
+  // This allows for recursion -> skip the language key
+  if (isset($field_collection[$language])) {
+    $field_collection = $field_collection[$language];
+    // Add in other top-level keys
+    foreach ($field_collection as $key => $item) {
+      $field_collection[$key]['field_name'] = $bundle;
+      $field_collection[$key]['item_id'] = NULL;
+      $field_collection[$key]['uuid'] = '';
+    }
+  }
+
+  if (!is_array($field_collection)) {
+    return;
+  }
+
+  foreach ($field_collection as $item_orig) {
+
+    // Allows for recursion -> skip to the item detail
+    if (isset($item_orig['item'])) {
+      $item_orig = $item_orig['item'];
+    }
+
+    // Check children and recurse if necessary to make sure all the child
+    // field collections are created first
+
+    $item = array();
+    if (!is_array($item_orig)) {
+      return;
+    }
+    foreach ($item_orig as $field_name => $field) {
+      if (isset($field[$language][0]['revision_id'])) {
+        $field2 = array();
+        foreach ($field[$language] as $i => $sub_value) {          // Recurse down for this field
+
+          $child_item_id = $field[$language][$i]['value'];
+
+          foreach ($node->node_export_dependency as $sub_item) {
+            if ($sub_item['id'] == $child_item_id) {
+              $field2[] = $sub_item['node_export_paragraph_data'];
+
+            }
+          }
+          if (count($field2 > 0)) {
+            $item[$field_name] = node_export_paragraphs_import_one_bundle($field_name, $language, $field2, $node);
+          }
+
+        }
+
+      }
+      else {
+        // Otherwise it is a simple copy
+        $item[$field_name] = $field;
+      }
+    }
+
+    // For entity reference field: adjust reference to point to new node.
+    node_export_paragraphs_update_entity_reference($bundle, $item);
+
+    $entity_controller = new EntityAPIController("paragraphs_item");
+    $item['item_id'] = NULL;
+    $item['original'] = TRUE;
+    $item_encoded = drupal_json_encode($item);
+
+    $entity = $entity_controller->import($item_encoded);
+    $saved = $entity_controller->save($entity);
+
+    // Can't find a way to get the entity's item_id via the API.
+    // This is a hack!
+    $item_id = db_query_range('SELECT item_id FROM {paragraphs_item} WHERE field_name = :field_name ORDER BY item_id DESC', 0, 1, array(':field_name' => $bundle))->fetchField();
+    $rev_id = db_query_range('SELECT revision_id FROM {paragraphs_item} WHERE field_name = :field_name ORDER BY item_id DESC', 0, 1, array(':field_name' => $bundle))->fetchField();
+    $field_values[$language][] = array(
+      'value' => $item_id,
+      'revision_id' => $rev_id
+    );
+  }
+
+  return $field_values;
+}
+
+function node_export_paragraphs_update_entity_reference($bundle_name, &$entity_field) {
+
+  // Get list of fields contained in this entity field.
+  $field_instance = field_info_instances('paragraphs_item', $bundle_name);
+
+  foreach ($field_instance as $field_name => $field_info) {
+    $field_definition = field_info_field($field_name);
+
+    // Check if field is an entity reference.
+    if ($field_definition['type'] == 'entityreference' && !empty($entity_field[$field_name])) {
+
+      // Get just the values of a field and it's language.
+      $field_data = $entity_field[$field_name];
+      // Get data.
+      $field_values = reset($field_data);
+      $language = key($field_data);
+
+      foreach ($field_values as $key => $entity_field_value) {
+        // Get nid from uuid
+        $uuid = $entity_field_value['entity']['uuid'];
+        $nids = entity_get_id_by_uuid('node', array($uuid));
+
+        // Update old nid to new nid.
+        if (!empty($nids)) {
+          $entity_field[$field_name][$language][$key]['target_id'] = $nids[$uuid];
+        }
+
+      }
+    }
+  }
+
+  return;
+}

@@ -1,0 +1,6 @@
+name = Node Export Paragraphs
+core = 7.x
+package = Paragraphs
+version = 7.x-1.0
+project = node_export_paragraphs
+dependencies[] =node_export_dependency
